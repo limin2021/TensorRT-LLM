@@ -171,7 +171,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     __syncthreads();
 
     // Update pattern
-    // 
+    //
     constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 21 : 10;
     if constexpr (step == 2)
     {

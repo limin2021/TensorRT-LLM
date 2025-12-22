@@ -161,6 +161,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
 {
     // Clear the histogram.
 #pragma unroll
+    // 2048个bin，记录每个bin里的元素个数？
     for (int idx = threadIdx.x; idx < kNumBins; idx += kNumThreadsPerBlock)
     {
         smemFinal.histo.data[idx] = 0;
@@ -170,6 +171,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     __syncthreads();
 
     // Update pattern
+    // 
     constexpr auto patternShift = step < 2 ? 0 : step == 2 ? 21 : 10;
     if constexpr (step == 2)
     {
@@ -192,10 +194,12 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     // Distribute the elements to the histogram bins.
     if (stride1 == 1)
     {
+        // row-major
         vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, distributeToBins);
     }
     else
     {
+        // col-major
         for (int idx = rowStart + threadIdx.x; idx < rowEnd; idx += kNumThreadsPerBlock)
         {
             float logit = logits[idx * stride1];
@@ -208,6 +212,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     // Reads the value of the starting position in the smemOutput array
     int lastValue = smemFoundTopKValues[0];
 
+    // bins[2048]
     for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++)
     {
         // Read the values from SMEM.
@@ -266,6 +271,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
+            // 把符合条件的bin里的元素存储下来作为output的候选
             if (binIdx < thresholdBinIdx)
             {
                 // The element is part of the top-k selection
@@ -401,10 +407,12 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
     __shared__ int smemThresholdBinIdx[1];
     // Shared memory counter to register the candidates for the final phase.
     __shared__ int smemFinalDstIdx[1];
+    // final bin 元素计数器
     // Shared memory to determine if the threshold bin fits in the final items.
     __shared__ int smemFinalBinSize[1];
     // Shared memory to keep track of the top-k values found so far by the
     // previous iterations
+    // 已确定 Top-K 元素数量
     __shared__ int smemFoundTopKValues[1];
 
     // The length of the row.

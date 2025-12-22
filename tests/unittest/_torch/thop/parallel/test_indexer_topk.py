@@ -207,14 +207,20 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     # Set input data
     row_starts = torch.zeros(batch_size, dtype=torch.int32, device="cuda")
     row_ends = torch.arange(1, batch_size + 1, device="cuda", dtype=torch.int32)
+    print("row_starts: ", row_starts)
+    print("row_ends: ", row_ends)
 
     logits = create_random_logits(row_starts, row_ends, torch.float32, 42)
+    print("logits.shape: ", logits.shape)
+    print("logits: ", logits)
 
     # Create output tensors
     indices = torch.empty((batch_size, index_topk), dtype=torch.int32, device="cuda")
+    print("indices.shape: ", indices.shape)
 
     # Run CUDA implementation
     torch.ops.trtllm.indexer_topk_prefill(logits, row_starts, row_ends, indices, index_topk)
+    print("indices: ", indices)
 
     # Run reference implementation
     torch_indices = logits.topk(min(index_topk, max(row_ends)), dim=-1)[1]
@@ -227,3 +233,8 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, index_topk
     ), "CUDA top_k_per_row results don't match torch.topk"
+
+    print("PASSED")
+
+
+test_indexer_topk_prefill(4, 8, 4096)

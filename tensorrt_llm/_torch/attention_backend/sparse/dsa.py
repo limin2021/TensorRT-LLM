@@ -1318,6 +1318,7 @@ class Indexer(nn.Module):
                     # Gather K from cache for this chunk (dual to _update_k_cache)
                     chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
                         metadata, chunk)
+                    # TODO: check this func
                     logits = fp8_mqa_logits(
                         q_fp8[chunk.token_start:chunk.token_end, ...],
                         (chunk_k_fp8, chunk_k_scale),
@@ -1423,6 +1424,7 @@ class Indexer(nn.Module):
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
+            # TODO: check this func
             logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
                                                  weights_decode, context_lens,
                                                  block_table,

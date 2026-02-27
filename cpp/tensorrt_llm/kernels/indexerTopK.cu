@@ -23,6 +23,8 @@
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 
+#include <stdio.h>
+
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
@@ -190,7 +192,8 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
             atomicAdd(&smemFinal.histo.data[binIdx], 1);
         }
     };
-
+    
+    // auto start = clock64();
     // Distribute the elements to the histogram bins.
     if (stride1 == 1)
     {
@@ -209,9 +212,16 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     // Make sure the histogram is ready.
     __syncthreads();
 
+    // auto end = clock64();
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("step-1 distribute to bins time: %lld \n", (end - start));
+    // }
+    // __syncthreads();
+
     // Reads the value of the starting position in the smemOutput array
     int lastValue = smemFoundTopKValues[0];
-
+    
+    // start = clock64();
     // bins[2048]
     for (int round = 0; round < kNumBins / kNumThreadsPerBlock; round++)
     {
@@ -262,6 +272,12 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
 
     // Make sure the data is in shared memory.
     __syncthreads();
+    
+    // end = clock64();
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("step-2 prefix sum time: %lld \n", (end - start));
+    // }
+    // __syncthreads();
 
     // The threshold bin.
     thresholdBinIdx = smemThresholdBinIdx[0];
@@ -271,7 +287,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
         if (isPartialMatch<patternShift>(logit, logitPattern))
         {
             uint32_t binIdx = extractBinIdx<step>(logit);
-            // 把符合条件的bin里的元素存储下来作为output的候选
+            // 把符合条件的bin里的元素存储下来作为output的一部分
             if (binIdx < thresholdBinIdx)
             {
                 // The element is part of the top-k selection
@@ -294,6 +310,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
             if constexpr (step < 3)
             {
                 // Only fill the final items for sorting if the threshold bin fits
+                // 最后一个bin的size<=2048时，才会存到smem中作为候选集，否则不存.
                 if (binIdx == thresholdBinIdx && smemFinalBinSize[0] <= kNumFinalItems)
                 {
                     int dstIdx = atomicAdd(&smemFinalDstIdx[0], 1);
@@ -317,6 +334,7 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
                 if (binIdx == thresholdBinIdx)
                 {
                     // The elements in the threshold bin share the same 32 bits at step 3
+                    // 随机写入剩下的value，值都是一样的（32-bit都一样）
                     int dstIdx = atomicAdd(&smemFinal.histo.data[binIdx], 1);
                     if (dstIdx < topK)
                     {
@@ -338,7 +356,8 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
             }
         }
     };
-
+    
+    // start = clock64();
     if (stride1 == 1)
     {
         vectorized_process(threadIdx.x, kNumThreadsPerBlock, logits + rowStart, rowEnd - rowStart, processBins);
@@ -355,7 +374,15 @@ __device__ bool processHistogramStep(int const* indices, float const* logits, in
     // Make sure the elements are in shared memory.
     __syncthreads();
 
+    // end = clock64();
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("    thresholdBinIdx = %d\n", thresholdBinIdx);
+    //     printf("step-3 r2s time: %lld \n", (end - start));
+    // }
+    // __syncthreads();
+
     // Check if we should continue to next step
+    // 最后一个bin的size>2048时，继续下一轮，否则结束。直接对smemFinal里的候选集进行排序，得到最终的top-k.
     return smemFinalBinSize[0] > kNumFinalItems;
 }
 
@@ -460,6 +487,9 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
         = processHistogramStep<0, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
             smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("after step 0, continueToNextStep: %d\n", continueToNextStep);
+    // }
 
     if (continueToNextStep)
     {
@@ -468,7 +498,11 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
             = processHistogramStep<1, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
                 indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
                 smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+        // if (threadIdx.x == 0 and blockIdx.x == 0) {
+        //     printf("after step 1, continueToNextStep: %d\n", continueToNextStep);
+        // }
     }
+    
 
     if (continueToNextStep)
     {
@@ -477,7 +511,11 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
             = processHistogramStep<2, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
                 indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx,
                 smemFinalDstIdx, smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+        // if (threadIdx.x == 0 and blockIdx.x == 0) {
+        //     printf("after step 2, continueToNextStep: %d\n", continueToNextStep);
+        // }
     }
+    
 
     if (continueToNextStep)
     {
@@ -485,8 +523,12 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
         processHistogramStep<3, kNumThreadsPerBlock, kNumBins, kNumFinalItems, multipleBlocksPerRow, mergeBlocks>(
             indices, logits, rowEnd, logitPattern, thresholdBinIdx, smemOutput, smemThresholdBinIdx, smemFinalDstIdx,
             smemFinalBinSize, smemFoundTopKValues, smemFinal, stride1, rowStart, topK);
+        // if (threadIdx.x == 0 and blockIdx.x == 0) {
+        //     printf("after step 3, continueToNextStep: %d\n", continueToNextStep);
+        // }
     }
-
+    
+    // auto start = clock64();
     if (!continueToNextStep)
     {
         // The histogram did not proceed to the final 10 bits, therefore we need to
@@ -495,6 +537,7 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
         if constexpr (useRadixSort)
         {
             // Sorting with radix sort
+            // 2048/512=4，每个thread处理4个元素
             float finalLogits[kNumFinalItemsPerThread];
             // The indices of the elements to be sorted in the final pass.
             int finalIndices[kNumFinalItemsPerThread];
@@ -571,6 +614,15 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
         __syncthreads();
     }
 
+    // auto end = clock64();
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("    smemFinalDstIdx[0] = %d\n", smemFinalDstIdx[0]);
+    //     printf("    smemFoundTopKValues[0] = %d\n", smemFoundTopKValues[0]);
+    //     printf("step-4 sort time: %lld \n", (end - start));
+    // }
+    // __syncthreads();
+    
+    // start = clock64();
     // Store to global memory.
     for (int i = threadIdx.x; i < topK; i += kNumThreadsPerBlock)
     {
@@ -592,6 +644,10 @@ static __device__ void topKPerRowJob(int const* indices, float const* logits, in
             }
         }
     }
+    // end = clock64();
+    // if (threadIdx.x == 0 and blockIdx.x == 0) {
+    //     printf("step-5 store to global memory time: %lld \n", (end - start));
+    // }
 }
 } // namespace
 
@@ -658,6 +714,7 @@ static __global__ __launch_bounds__(kNumThreadsPerBlock) void topKPerRowDecode(f
     }
     else if constexpr (mergeBlocks)
     {
+        // 第一个kernel后的output不是变长的了，被填充成了fix-length的
         rowEnd = numBlocksToMerge * topK;
         indices += rowIdx * numBlocksToMerge * topK;
         outIndices += rowIdx * topK;
@@ -758,22 +815,48 @@ void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int con
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK,
     cudaStream_t const stream)
 {
-    constexpr int kSortingAlgorithmThreshold = 12288;
+    // constexpr int kSortingAlgorithmThreshold = 12288;
+    // constexpr int kNumThreadsPerBlock = 512;
+
+    // int numInsertionBlocks = std::min(numRows, kSortingAlgorithmThreshold);
+
+    // topKPerRowPrefill<kNumThreadsPerBlock, false>
+    //     <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+    //         logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+
+    // // TODO: 为什么要根据行数来决定是否使用radix sort？
+    // if (numRows > kSortingAlgorithmThreshold)
+    // {
+    //     int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
+    //     topKPerRowPrefill<kNumThreadsPerBlock, true>
+    //         <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+    //             logits, rowStarts, rowEnds, indices, stride0, stride1, topK, kSortingAlgorithmThreshold);
+    // }
+
+    // // use radix sort.
+    // topKPerRowPrefill<kNumThreadsPerBlock, true>
+    //     <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+    //         logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+    
+    // updated version: use column number to decide whether to use radix sort.
+    //constexpr int kSortingAlgorithmThreshold = 16384;
+    // constexpr int kSortingAlgorithmThreshold = 131072;
     constexpr int kNumThreadsPerBlock = 512;
 
-    int numInsertionBlocks = std::min(numRows, kSortingAlgorithmThreshold);
+    // int numInsertionBlocks = std::min(numColumns, kSortingAlgorithmThreshold);
+
+    // if (numColumns <= kSortingAlgorithmThreshold)
+    //     topKPerRowPrefill<kNumThreadsPerBlock, false>
+    //         <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+    //             logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+    // else {
+    //     topKPerRowPrefill<kNumThreadsPerBlock, true>
+    //         <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+    //             logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
+    // }
     topKPerRowPrefill<kNumThreadsPerBlock, false>
-        <<<numInsertionBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
+        <<<numRows, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
             logits, rowStarts, rowEnds, indices, stride0, stride1, topK, 0);
-
-    if (numRows > kSortingAlgorithmThreshold)
-    {
-        int numRadixBlocks = numRows - kSortingAlgorithmThreshold;
-        topKPerRowPrefill<kNumThreadsPerBlock, true>
-            <<<numRadixBlocks, kNumThreadsPerBlock, topK * sizeof(int32_t), stream>>>(
-                logits, rowStarts, rowEnds, indices, stride0, stride1, topK, kSortingAlgorithmThreshold);
-    }
-
     sync_check_cuda_error(stream);
 }
 

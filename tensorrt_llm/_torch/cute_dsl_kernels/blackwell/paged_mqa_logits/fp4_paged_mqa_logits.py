@@ -67,6 +67,87 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 #                        raises TypeError per nvvm_wrappers.from_str).
 _RND_RN = getattr(getattr(nvvm, "RoundingModeKind", None), "RN", None) or "rn"
 
+# Compiler scheduling fence (internal-only):
+# `cute.nvgpu.cfence()` injects `.pragma "next knob FenceCode"` — a compile-
+# time barrier preventing instructions before/after from being reordered
+# across it. Only exported by the internal wheel; falls back to no-op on
+# public 4.4.x / 4.5.x. Used to pin the umma consumer_release to its source
+# position so the compiler does not push it down to right before STG.
+_cfence = getattr(getattr(cute, "nvgpu", None), "cfence", lambda: None)
+
+
+@dsl_user_op
+def _predicated_load_i32(
+    addr_i64,  # raw GMEM byte address (cutlass.Int64)
+    pred,  # cutlass.Boolean
+    *,
+    loc=None,
+    ip=None,
+):
+    """Predicated 32-bit GMEM load via inline PTX. When pred=False, the load
+    is skipped and the returned register is undefined — callers MUST guard
+    the result with cutlass.select_(pred, loaded, fallback).
+
+    Calls the low-level MLIR `nvvm.inline_ptx` op directly rather than the
+    `cute.arch.inline_ptx` Python wrapper. The wrapper is internal-only
+    (stripped from some wheels via `# {$nv-internal-release}` markers); the
+    MLIR-dialect op is auto-generated and present on every wheel. Both lower
+    to identical PTX/SASS (`@P LDG.E`) — only the type-plumbing layer differs.
+
+    Workaround for `predicate=...` operand-indexing bug when `write_only_args`
+    is non-empty: append predicate to read_only_args and prepend `@{$rN}` to
+    the PTX string manually."""
+    addr_ir = addr_i64.ir_value() if hasattr(addr_i64, "ir_value") else addr_i64
+    pred_ir = pred.ir_value() if hasattr(pred, "ir_value") else pred
+    result = nvvm.inline_ptx(
+        [cutlass.Int32.mlir_type],  # write_only_args (MLIR types)
+        [addr_ir, pred_ir],  # read_only_args
+        [],  # read_write_args
+        "@{$r1} ld.global.u32 {$w0}, [{$r0}];",
+    )
+    return cutlass.Int32(result)
+
+
+@dsl_user_op
+def _predicated_load_i32_llvm(
+    addr_i64,  # raw GMEM byte address (cutlass.Int64)
+    pred,  # cutlass.Boolean (i1)
+    *,
+    loc=None,
+    ip=None,
+):
+    """Cross-wheel predicated 32-bit GMEM load.
+
+    Same contract as `_predicated_load_i32` (predicated load; result undefined
+    when pred=False; caller must `cutlass.select_` over it), but uses the
+    LLVM-dialect `llvm.inline_asm` op instead of `nvvm.inline_ptx`.
+
+    Motivation: `nvvm.inline_ptx` is internal-only — present on the dkg
+    internal wheel but NOT on PyPI 4.4.x/4.5.x. `llvm.inline_asm` is the
+    LLVM-dialect's generic asm op, exposed on every wheel (used throughout
+    `cute.arch.nvvm_wrappers` for `bar.sync` etc.). Lowered PTX/SASS is
+    identical (both emit `@P LDG.E`).
+
+    Implementation:
+      1. Zero-extend i1 pred → i32 (pass via "r" register constraint).
+      2. Inside the asm block, `setp.ne.b32` re-materializes a .pred register.
+      3. `@p ld.global.u32` does the conditional load."""
+    addr_ir = addr_i64.ir_value(loc=loc, ip=ip) if hasattr(addr_i64, "ir_value") else addr_i64
+    pred_i32_ir = cutlass.Int32(pred).ir_value(loc=loc, ip=ip)
+    asm = "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $2, 0;\n\t@p ld.global.u32 $0, [$1];\n\t}"
+    result = llvm.inline_asm(
+        cutlass.Int32.mlir_type,
+        [addr_ir, pred_i32_ir],
+        asm,
+        "=r,l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
 
 @dsl_user_op
 def pack_f16x2(
@@ -364,6 +445,7 @@ class FP4MQALogitsKernel:
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        use_cfence: bool = True,
     ):
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
@@ -398,6 +480,10 @@ class FP4MQALogitsKernel:
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        # A/B switch for compiler-scheduling fence around umma consumer_release.
+        # Captured at JIT trace time → flipping this gives two separate compiled
+        # kernels (cute.compile cache keys differ via self identity).
+        self.use_cfence = use_cfence
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
         self.epi_bytes = 2 if epi_dtype in (cutlass.Float16, cutlass.BFloat16) else 4
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
@@ -1398,15 +1484,28 @@ class FP4MQALogitsKernel:
                     )
                 kv_prod_state_0.advance()
 
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
-                # Update while-loop condition
+                # Advance: inline fetch_next_task — branch-free (see umma_warp_0
+                # site for rationale; eliminates 2 BRA per iter).
+                next_kv_idx_n = kv_idx + NUM_MATH_WG
+                pred_q_change = next_kv_idx_n >= num_kv
+                next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                pred_load = pred_q_change & (next_q_idx_n < batch_size)
+                elem_ptr = mContextLens.iterator + next_q_idx_n
+                ctx_val = _predicated_load_i32_llvm(elem_ptr.toint(), pred_load)
+                new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+                next_q_idx, next_kv_idx, next_num_kv = next_q_idx_n, next_kv_idx_n, next_num_kv_n
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # OLD branched version (kept for revert; lowers to 2 BRA):
+                # next_kv_idx = kv_idx + NUM_MATH_WG
+                # if next_kv_idx >= num_kv:
+                #     next_q_idx = q_idx + 1
+                #     next_kv_idx = 0
+                #     if next_q_idx < batch_size:
+                #         next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
@@ -1466,15 +1565,28 @@ class FP4MQALogitsKernel:
                     )
                 kv_prod_state_1.advance()
 
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
-                # Update while-loop condition
+                # Advance: inline fetch_next_task — branch-free (see umma_warp_0
+                # site for rationale; eliminates 2 BRA per iter).
+                next_kv_idx_n = kv_idx + NUM_MATH_WG
+                pred_q_change = next_kv_idx_n >= num_kv
+                next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                pred_load = pred_q_change & (next_q_idx_n < batch_size)
+                elem_ptr = mContextLens.iterator + next_q_idx_n
+                ctx_val = _predicated_load_i32_llvm(elem_ptr.toint(), pred_load)
+                new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+                next_q_idx, next_kv_idx, next_num_kv = next_q_idx_n, next_kv_idx_n, next_num_kv_n
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                # OLD branched version (kept for revert; lowers to 2 BRA):
+                # next_kv_idx = kv_idx + NUM_MATH_WG
+                # if next_kv_idx >= num_kv:
+                #     next_q_idx = q_idx + 1
+                #     next_kv_idx = 0
+                #     if next_q_idx < batch_size:
+                #         next_num_kv = (mContextLens[next_q_idx] + block_kv_val - 1) // block_kv_val
+                # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_umma_warp_0:
             # UMMA warp for group 0
@@ -1630,17 +1742,42 @@ class FP4MQALogitsKernel:
                     # land before warp 1's previous MMA has committed.
                     sfb_sync_barrier.arrive_and_wait()
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
+                    # Advance: inline fetch_next_task — branch-free via
+                    # cutlass.select_ + predicated GMEM load. Original two
+                    # `if`s lower to 2 BRA per iter; this version uses SELP
+                    # and @-predicated `ld.global.u32`.
+                    next_kv_idx_n = kv_idx + NUM_MATH_WG
+                    pred_q_change = next_kv_idx_n >= num_kv
+                    next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                    next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                    pred_load = pred_q_change & (next_q_idx_n < batch_size)
+
+                    # Predicated load of mContextLens[next_q_idx_n]; result
+                    # is undefined when pred_load=False — select_ below discards it.
+                    elem_ptr = mContextLens.iterator + next_q_idx_n
+                    addr_i64 = elem_ptr.toint()
+                    ctx_val = _predicated_load_i32_llvm(addr_i64, pred_load)
+                    new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                    next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+
+                    # Commit + while-loop condition
+                    next_q_idx, next_kv_idx, next_num_kv = (
+                        next_q_idx_n,
+                        next_kv_idx_n,
+                        next_num_kv_n,
+                    )
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                    # OLD branched version (kept for revert; lowers to 2 BRA):
+                    # next_kv_idx = kv_idx + NUM_MATH_WG
+                    # if next_kv_idx >= num_kv:
+                    #     next_q_idx = q_idx + 1
+                    #     next_kv_idx = 0
+                    #     if next_q_idx < batch_size:
+                    #         next_num_kv = (
+                    #             mContextLens[next_q_idx] + block_kv_val - 1
+                    #         ) // block_kv_val
+                    # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_umma_warp_1:
             # UMMA warp for group 1
@@ -1759,17 +1896,34 @@ class FP4MQALogitsKernel:
                     # reading it.
                     sfb_sync_barrier.arrive_and_wait()
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
+                    # Advance: inline fetch_next_task — branch-free (see umma_warp_0
+                    # site for rationale; eliminates 2 BRA per iter).
+                    next_kv_idx_n = kv_idx + NUM_MATH_WG
+                    pred_q_change = next_kv_idx_n >= num_kv
+                    next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                    next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                    pred_load = pred_q_change & (next_q_idx_n < batch_size)
+                    elem_ptr = mContextLens.iterator + next_q_idx_n
+                    ctx_val = _predicated_load_i32_llvm(elem_ptr.toint(), pred_load)
+                    new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                    next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+                    next_q_idx, next_kv_idx, next_num_kv = (
+                        next_q_idx_n,
+                        next_kv_idx_n,
+                        next_num_kv_n,
+                    )
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                    # OLD branched version (kept for revert; lowers to 2 BRA):
+                    # next_kv_idx = kv_idx + NUM_MATH_WG
+                    # if next_kv_idx >= num_kv:
+                    #     next_q_idx = q_idx + 1
+                    #     next_kv_idx = 0
+                    #     if next_q_idx < batch_size:
+                    #         next_num_kv = (
+                    #             mContextLens[next_q_idx] + block_kv_val - 1
+                    #         ) // block_kv_val
+                    # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
@@ -1895,9 +2049,15 @@ class FP4MQALogitsKernel:
                                     tTR_rAcc,
                                 )
                                 cute.arch.fence_view_async_tmem_load()
-                            # Release UMMA after last LDTM+fence
+                            # Release UMMA after last LDTM+fence.
+                            # cfence pins the arrive at its source position so the
+                            # compiler does not push it down before STG.
                             if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                if cutlass.const_expr(self.use_cfence):
+                                    _cfence()
                                 umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                if cutlass.const_expr(self.use_cfence):
+                                    _cfence()
                                 umma_cons_state_0.advance()
                             acc_vec = tTR_rAcc.load()
                             # Reg-path: weights from registers
@@ -2026,17 +2186,34 @@ class FP4MQALogitsKernel:
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
+                    # Advance: inline fetch_next_task — branch-free (see umma_warp_0
+                    # site for rationale; eliminates 2 BRA per iter).
+                    next_kv_idx_n = kv_idx + NUM_MATH_WG
+                    pred_q_change = next_kv_idx_n >= num_kv
+                    next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                    next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                    pred_load = pred_q_change & (next_q_idx_n < batch_size)
+                    elem_ptr = mContextLens.iterator + next_q_idx_n
+                    ctx_val = _predicated_load_i32_llvm(elem_ptr.toint(), pred_load)
+                    new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                    next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+                    next_q_idx, next_kv_idx, next_num_kv = (
+                        next_q_idx_n,
+                        next_kv_idx_n,
+                        next_num_kv_n,
+                    )
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                    # OLD branched version (kept for revert; lowers to 2 BRA):
+                    # next_kv_idx = kv_idx + NUM_MATH_WG
+                    # if next_kv_idx >= num_kv:
+                    #     next_q_idx = q_idx + 1
+                    #     next_kv_idx = 0
+                    #     if next_q_idx < batch_size:
+                    #         next_num_kv = (
+                    #             mContextLens[next_q_idx] + block_kv_val - 1
+                    #         ) // block_kv_val
+                    # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
                 # Release last Q stage (WG 0)
                 if q_idx < batch_size:
@@ -2133,8 +2310,13 @@ class FP4MQALogitsKernel:
                                     tTR_rAcc,
                                 )
                                 cute.arch.fence_view_async_tmem_load()
+                            # cfence pins the arrive — see warp_0 site for rationale.
                             if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                if cutlass.const_expr(self.use_cfence):
+                                    _cfence()
                                 umma_pipeline_1.consumer_release(umma_cons_state_1)
+                                if cutlass.const_expr(self.use_cfence):
+                                    _cfence()
                                 umma_cons_state_1.advance()
                             acc_vec = tTR_rAcc.load()
                             # Reg-path
@@ -2263,17 +2445,34 @@ class FP4MQALogitsKernel:
                         # Step 5.7: drop * scale_val (FP4 SF baked into acc).
                         mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                    # Update while-loop condition
+                    # Advance: inline fetch_next_task — branch-free (see umma_warp_0
+                    # site for rationale; eliminates 2 BRA per iter).
+                    next_kv_idx_n = kv_idx + NUM_MATH_WG
+                    pred_q_change = next_kv_idx_n >= num_kv
+                    next_q_idx_n = cutlass.select_(pred_q_change, q_idx + cutlass.Int32(1), q_idx)
+                    next_kv_idx_n = cutlass.select_(pred_q_change, cutlass.Int32(0), next_kv_idx_n)
+                    pred_load = pred_q_change & (next_q_idx_n < batch_size)
+                    elem_ptr = mContextLens.iterator + next_q_idx_n
+                    ctx_val = _predicated_load_i32_llvm(elem_ptr.toint(), pred_load)
+                    new_num_kv = (ctx_val + block_kv_val - 1) // block_kv_val
+                    next_num_kv_n = cutlass.select_(pred_load, new_num_kv, next_num_kv)
+                    next_q_idx, next_kv_idx, next_num_kv = (
+                        next_q_idx_n,
+                        next_kv_idx_n,
+                        next_num_kv_n,
+                    )
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+                    # OLD branched version (kept for revert; lowers to 2 BRA):
+                    # next_kv_idx = kv_idx + NUM_MATH_WG
+                    # if next_kv_idx >= num_kv:
+                    #     next_q_idx = q_idx + 1
+                    #     next_kv_idx = 0
+                    #     if next_q_idx < batch_size:
+                    #         next_num_kv = (
+                    #             mContextLens[next_q_idx] + block_kv_val - 1
+                    #         ) // block_kv_val
+                    # has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
                 # Release last Q stage (WG 1)
                 if q_idx < batch_size:

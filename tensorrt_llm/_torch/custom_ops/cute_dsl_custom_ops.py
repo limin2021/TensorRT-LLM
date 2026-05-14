@@ -6745,12 +6745,21 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, compute_block_kv, phys_block_kv, num_heads, head_dim,
-                     next_n, num_sms, num_epi_subtiles, epi_dtype,
-                     output_dtype):
+        def _compile(cls,
+                     compute_block_kv,
+                     phys_block_kv,
+                     num_heads,
+                     head_dim,
+                     next_n,
+                     num_sms,
+                     num_epi_subtiles,
+                     epi_dtype,
+                     output_dtype,
+                     use_cfence=True):
             """Compile kernel using fake tensors + TVM FFI."""
             key = (compute_block_kv, phys_block_kv, num_heads, head_dim, next_n,
-                   num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                   num_sms, num_epi_subtiles, epi_dtype, output_dtype,
+                   use_cfence)
             if key in cls.kernel_cache:
                 return
 
@@ -6820,8 +6829,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_epi_subtiles=num_epi_subtiles,
                 epi_dtype=to_cutlass[epi_dtype],
                 output_dtype=to_cutlass[output_dtype],
+                use_cfence=use_cfence,
             )
 
+            # --uumn: ptxas-internal knob that activates the `FenceCode` pragma
+            # emitted by `cute.nvgpu.cfence()`. Without it, ptxas silently ignores
+            # the pragma and `use_cfence=True` becomes a no-op (SASS unchanged).
+            # Internal-only knob — only emitted by the internal cutlass-dsl wheel.
+            compile_opts = "--enable-tvm-ffi"
+            if use_cfence:
+                compile_opts += " --ptxas-options '--uumn'"
             compiled = cute.compile(
                 kernel,
                 kv_fake,
@@ -6835,7 +6852,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 cutlass.Int32(1),
                 cutlass.Int32(1),
                 fake_stream,
-                options="--enable-tvm-ffi",
+                options=compile_opts,
             )
             cls.kernel_cache[key] = compiled
             logger.debug(f"[compile cute_dsl fp4_paged_mqa_logits] {key}")
@@ -6854,6 +6871,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_epi_subtiles: int = 1,
             epi_dtype: torch.dtype = torch.float32,
             output_dtype: torch.dtype = torch.float32,
+            use_cfence: bool = True,
         ) -> torch.Tensor:
             """Execute FP4 paged MQA logits kernel.
 
@@ -6921,10 +6939,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Compile if needed (fake tensors, no real data required)
             key = (compute_block_kv, phys_block_kv, H, D, next_n, num_sms,
-                   num_epi_subtiles, epi_dtype, output_dtype)
+                   num_epi_subtiles, epi_dtype, output_dtype, use_cfence)
             if key not in cls.kernel_cache:
-                cls._compile(compute_block_kv, phys_block_kv, H, D, next_n,
-                             num_sms, num_epi_subtiles, epi_dtype, output_dtype)
+                cls._compile(compute_block_kv,
+                             phys_block_kv,
+                             H,
+                             D,
+                             next_n,
+                             num_sms,
+                             num_epi_subtiles,
+                             epi_dtype,
+                             output_dtype,
+                             use_cfence=use_cfence)
             compiled = cls.kernel_cache[key]
 
             # TVM FFI: pass raw tensors, no dlpack/stream needed
@@ -6947,6 +6973,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        use_cfence: bool = True,
     ) -> torch.Tensor:
         if not is_sm_100f():
             raise ValueError(
@@ -6983,7 +7010,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             max_context_len,
             num_epi_subtiles=num_epi_subtiles,
             epi_dtype=epi_dtype,
-            output_dtype=output_dtype)
+            output_dtype=output_dtype,
+            use_cfence=use_cfence)
 
     @torch.library.register_fake("trtllm::cute_dsl_fp4_paged_mqa_logits")
     def _(
@@ -6998,6 +7026,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_epi_subtiles: int = 1,
         epi_dtype: torch.dtype = torch.float32,
         output_dtype: torch.dtype = torch.float32,
+        use_cfence: bool = True,
     ) -> torch.Tensor:
         B = q.shape[0]
         next_n = q.shape[1]

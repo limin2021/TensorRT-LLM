@@ -370,6 +370,7 @@ def _compile_fp4_kernel(
     num_epi_subtiles: int,
     epi_dtype,
     output_dtype,
+    use_cfence: bool = True,
 ):
     """Compile FP4 kernel with fake tensors + TVM FFI; cached by static config."""
     key = (
@@ -382,6 +383,7 @@ def _compile_fp4_kernel(
         num_epi_subtiles,
         epi_dtype,
         output_dtype,
+        use_cfence,
     )
     if key in _compiled_cache:
         return _compiled_cache[key]
@@ -428,6 +430,7 @@ def _compile_fp4_kernel(
         num_epi_subtiles=num_epi_subtiles,
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
+        use_cfence=use_cfence,
     )
     compiled = cute.compile(
         kernel,
@@ -442,7 +445,10 @@ def _compile_fp4_kernel(
         cutlass.Int32(1),
         cutlass.Int32(1),
         fake_stream,
-        options="--enable-tvm-ffi",
+        # --uumn: ptxas-internal knob that activates the `FenceCode` pragma
+        # emitted by `cute.nvgpu.cfence()`. Without it, ptxas silently ignores
+        # the pragma and the SASS schedule is unchanged. Internal-only knob.
+        options="--enable-tvm-ffi --ptxas-options '--uumn'",
     )
     _compiled_cache[key] = compiled
     print(
@@ -466,6 +472,7 @@ def fp4_paged_mqa_logits(
     epi_dtype=cutlass.Float32,
     output_dtype=cutlass.Float32,
     num_sms: int = 148,
+    use_cfence: bool = True,
 ) -> torch.Tensor:
     """Standalone wrapper around FP4MQALogitsKernel; no trtllm dependency.
 
@@ -513,6 +520,7 @@ def fp4_paged_mqa_logits(
         num_epi_subtiles,
         epi_dtype,
         output_dtype,
+        use_cfence=use_cfence,
     )
     compiled(
         kv_flat,
@@ -609,6 +617,7 @@ def run(
     seed: int = 42,
     num_sms: int = 148,
     verify_meta: bool = False,
+    use_cfence: bool = True,
 ) -> float:
     """Generate random inputs, run kernel, compare to reference, print result.
 
@@ -710,6 +719,7 @@ def run(
         epi_dtype=epi_dtype,
         output_dtype=output_dtype,
         num_sms=num_sms,
+        use_cfence=use_cfence,
     )
 
     positions = (
@@ -794,6 +804,11 @@ if __name__ == "__main__":
         action="store_true",
         help="verify CuTe DSL schedule_meta kernel against the pure-Python reference",
     )
+    parser.add_argument(
+        "--no_cfence",
+        action="store_true",
+        help="disable cute.nvgpu.cfence() around umma consumer_release (A/B perf test); default = enabled",
+    )
     args = parser.parse_args()
 
     print("=== FP4 paged MQA logits standalone test ===")
@@ -811,4 +826,5 @@ if __name__ == "__main__":
         tol=args.tol,
         num_sms=args.num_sms,
         verify_meta=args.verify_meta,
+        use_cfence=not args.no_cfence,
     )
